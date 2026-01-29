@@ -4,315 +4,313 @@ import requests
 import datetime
 import time
 import random
+import re
 
 # === 🎨 页面配置 ===
 st.set_page_config(
-    page_title="Plan A 猎人终端 (腾讯源)",
+    page_title="Plan A 猎人终端 (终极修正版)",
     page_icon="🦅",
     layout="wide"
 )
 
-# === 🧠 腾讯财经数据引擎 (Tencent Engine) ===
+# === 🚑 网络环境初始化 ===
+import os
+os.environ['HTTP_PROXY'] = ''
+os.environ['HTTPS_PROXY'] = ''
+os.environ['ALL_PROXY'] = ''
+os.environ['NO_PROXY'] = '*'
+
+# === 🧠 核心数据引擎 ===
 
 def get_headers():
-    """伪装浏览器头"""
     return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        "Referer": "http://finance.qq.com/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://finance.sina.com.cn/"
     }
 
-def get_stock_history_tencent(code):
+def get_hs300_status():
     """
-    从腾讯获取历史K线 (前复权)
-    接口: http://web.ifzq.gtimg.cn/appstock/app/fqkline/get
+    获取沪深300状态 (修复版)
+    腾讯接口: sh000300
     """
     try:
-        # 处理代码前缀 sh/sz
-        symbol = f"sh{code}" if code.startswith('6') else f"sz{code}"
-        
-        # 获取最近 60 天数据
-        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,60,qfq"
-        
-        resp = requests.get(url, headers=get_headers(), timeout=5)
+        # 腾讯K线接口
+        url = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000300,day,,,80,qfq"
+        resp = requests.get(url, headers=get_headers(), timeout=3)
         data = resp.json()
         
-        # 解析 JSON
-        # 路径: data -> code -> qfqday (前复权) 或 day (如果不复权)
-        # 腾讯有时候没有 qfqday 字段，说明没有分红，直接用 day
-        kline_data = data['data'][symbol].get('qfqday', data['data'][symbol].get('day'))
+        # 解析路径: data -> sh000300 -> day
+        kline = data['data']['sh000300']['day']
         
-        if not kline_data: return pd.DataFrame()
-        
-        # 转换为 DataFrame
-        # 格式: [日期, 开盘, 收盘, 最高, 最低, 成交量]
-        df = pd.DataFrame(kline_data, columns=['date', 'open', 'close', 'high', 'low', 'vol'])
-        df['date'] = pd.to_datetime(df['date'])
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
+        df = pd.DataFrame(kline, columns=['date', 'open', 'close', 'high', 'low', 'vol'])
         df['close'] = df['close'].astype(float)
         
-        return df
-        
-    except Exception as e:
-        # print(f"历史获取失败: {e}")
-        return pd.DataFrame()
-
-def get_realtime_batch_tencent(code_list):
-    """
-    批量获取实时行情 (腾讯极速接口)
-    接口: http://qt.gtimg.cn/q=sh600519,sz000001...
-    """
-    try:
-        # 加上前缀
-        symbols = []
-        for c in code_list:
-            if c.startswith('6'): symbols.append(f"sh{c}")
-            else: symbols.append(f"sz{c}")
-            
-        # 拼接 URL
-        codes_str = ",".join(symbols)
-        url = f"http://qt.gtimg.cn/q={codes_str}"
-        
-        resp = requests.get(url, headers=get_headers(), timeout=5)
-        
-        # 解析返回的文本
-        # 格式: v_sh600519="1:名字~2:代码~3:当前价~4:昨收~...~30:时间~..."
-        results = []
-        lines = resp.text.split(';')
-        
-        for line in lines:
-            if len(line) < 10: continue
-            content = line.split('"')[1]
-            data = content.split('~')
-            
-            if len(data) < 30: continue
-            
-            # 提取关键字段
-            name = data[1]
-            code = data[2]
-            price = float(data[3])
-            last_close = float(data[4])
-            
-            # 计算涨幅
-            pct_chg = 0
-            if last_close > 0:
-                pct_chg = (price - last_close) / last_close * 100
-                
-            # 简单的量比估算 (腾讯接口直接量比数据不准，这里用简化逻辑)
-            # 或者我们依赖历史数据计算量比，这里先只取涨幅
-            
-            results.append({
-                'code': code,
-                'name': name,
-                'price': price,
-                'pct': pct_chg,
-                'vol_str': data[6] # 成交量(手)
-            })
-            
-        return pd.DataFrame(results)
-        
-    except Exception as e:
-        return pd.DataFrame()
-
-def get_market_rank_sina():
-    """
-    获取全市场涨幅榜/量比榜 (利用新浪网页接口，作为初筛池)
-    因为腾讯没有直接的全市场排行接口，新浪的 html 接口更开放
-    """
-    try:
-        # 这里为了演示稳定，我们手动定义一些热门股或者沪深300成分股作为扫描池
-        # 真实全市场扫描需要爬取多页，云端容易超时
-        # 策略：我们扫描【近期热门】和【沪深300】
-        
-        # 这里我们用一个简化的 Trick：
-        # 直接扫描 沪深300 权重股 + 一些热门代码
-        # 为了演示效果，我内置一个常用的观察池 (实际可以用 requests 爬取 sina vip 接口)
-        
-        # 既然要求全市场，我们用 requests 爬取新浪行情的 json
-        # 获取沪深A股涨幅榜前 80 名 (作为活跃股代表)
-        url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page=1&num=80&sort=changepercent&asc=0&node=hs_a&symbol=&_s_r_a=page"
-        
-        resp = requests.get(url, headers=get_headers(), timeout=5)
-        data = eval(resp.text) # 新浪返回的是 JS 对象格式
-        
-        code_list = [x['symbol'].replace('sh','').replace('sz','') for x in data]
-        return code_list
-        
-    except:
-        # 如果爬取失败，返回一个保底列表 (茅台等龙头)
-        return ['600519','300750','601318','000858','002594','600036','601012','000001']
-
-# === 🧠 策略逻辑整合 ===
-
-@st.cache_data(ttl=300)
-def check_market_status():
-    """检查大盘 (MA60)"""
-    try:
-        # 获取沪深300历史
-        df = get_stock_history_tencent('000300') # 000300 在腾讯是 sh000300
-        if df.empty: return False, 0, 0
-        
-        curr = df.iloc[-1]['close']
+        current_close = df.iloc[-1]['close']
         ma60 = df['close'].rolling(60).mean().iloc[-1]
-        return curr > ma60, curr, ma60
-    except:
-        return False, 0, 0
+        
+        is_safe = current_close > ma60
+        return is_safe, current_close, ma60, "获取成功"
+    except Exception as e:
+        return False, 0, 0, str(e)
 
-def run_scanner_tencent():
+def get_stock_history_tencent(code):
+    """获取个股历史 (自动识别前缀)"""
+    try:
+        # 前缀逻辑
+        if code.startswith('6'): symbol = f"sh{code}"
+        elif code.startswith('8') or code.startswith('4'): return pd.DataFrame() # 排除北交所/三板
+        else: symbol = f"sz{code}" # 00/30开头
+        
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},day,,,60,qfq"
+        resp = requests.get(url, headers=get_headers(), timeout=2) # 超时设置短一点，失败就重试
+        data = resp.json()
+        
+        # 腾讯数据可能在 qfqday 或 day 里
+        stock_data = data['data'].get(symbol, {})
+        kline = stock_data.get('qfqday', stock_data.get('day'))
+        
+        if not kline: return pd.DataFrame()
+        
+        df = pd.DataFrame(kline, columns=['date', 'open', 'close', 'high', 'low', 'vol'])
+        # 转换数值
+        for col in ['open', 'close', 'high', 'low']:
+            df[col] = df[col].astype(float)
+            
+        return df
+    except:
+        return pd.DataFrame()
+
+def get_active_stocks_sina():
+    """
+    获取全市场成交额前 300 名的股票 (新浪接口)
+    逻辑：只扫描活跃股，死鱼股没有突破意义
+    """
+    stock_list = []
+    page = 1
+    max_page = 4 # 抓取前4页，每页80只，共320只最活跃的股票 (包含ETF等，后续过滤)
+    
+    status_text = st.empty()
+    
+    while page <= max_page:
+        try:
+            status_text.text(f"正在获取市场活跃名单... 第 {page}/{max_page} 页")
+            # 按成交额(amount)排序
+            url = f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?page={page}&num=80&sort=amount&asc=0&node=hs_a&symbol=&_s_r_a=page"
+            resp = requests.get(url, headers=get_headers(), timeout=5)
+            
+            # 简单的正则提取或者eval
+            raw_data = resp.text
+            if not raw_data or raw_data == '[]': break
+            
+            # 新浪返回的是非标准JSON (key没有引号)，eval通常能解析
+            # 如果eval失败，跳过
+            data = eval(raw_data)
+            
+            for item in data:
+                stock_list.append({
+                    'code': item['symbol'].replace('sh','').replace('sz',''),
+                    'name': item['name'],
+                    'price': float(item['trade']),
+                    'pct': float(item['changepercent'])
+                })
+            
+            page += 1
+            time.sleep(0.5) # 防封
+            
+        except Exception as e:
+            st.error(f"名单获取中断: {e}")
+            break
+            
+    status_text.empty()
+    return pd.DataFrame(stock_list)
+
+def run_full_scan():
+    """执行扫描逻辑"""
     st_status = st.empty()
     st_bar = st.progress(0)
     
-    st_status.text("正在从新浪获取活跃股名单...")
+    # 1. 获取名单
+    df_pool = get_active_stocks_sina()
     
-    # 1. 获取候选池 (活跃股)
-    codes = get_market_rank_sina()
-    total = len(codes)
-    
-    st_status.text(f"锁定 {total} 只活跃股票，开始腾讯接口深度扫描...")
-    
-    # 2. 批量获取实时行情 (腾讯支持一次请求多只)
-    # 分批请求，每批 20 只
-    batch_size = 20
-    realtime_data = []
-    
-    for i in range(0, total, batch_size):
-        batch_codes = codes[i:i+batch_size]
-        df_batch = get_realtime_batch_tencent(batch_codes)
-        if not df_batch.empty:
-            realtime_data.append(df_batch)
-        time.sleep(0.1) # 极短延时即可，腾讯很快
-        
-    if not realtime_data:
-        st.error("无法连接行情服务器")
+    if df_pool.empty:
+        st.error("未能获取股票名单，请检查网络或稍后重试。")
         return pd.DataFrame()
-        
-    df_all = pd.concat(realtime_data)
     
-    # 3. 逐个分析历史趋势 (Plan A 逻辑)
-    final_list = []
+    # 2. 过滤基础条件 (价格<80, 涨幅>0)
+    # Plan A 基础过滤
+    df_pool = df_pool[
+        (df_pool['price'] < 80) & 
+        (df_pool['price'] > 0) & 
+        (df_pool['pct'] > 0) & # 必须红盘
+        (~df_pool['name'].str.contains('ST')) &
+        (~df_pool['name'].str.contains('退'))
+    ]
     
-    # 初筛: 涨幅 > 0 (只看红盘)
-    candidates = df_all[df_all['pct'] > 0]
-    total_scan = len(candidates)
+    total = len(df_pool)
+    st_status.text(f"初筛锁定 {total} 只活跃股票，开始计算海龟突破指标...")
     
-    for i, (idx, row) in enumerate(candidates.iterrows()):
+    results = []
+    
+    # 3. 逐个分析
+    for i, (idx, row) in enumerate(df_pool.iterrows()):
         code = row['code']
         name = row['name']
         price = row['price']
         
-        pct = int(((i+1) / total_scan) * 100)
+        # 进度更新
+        pct = int(((i+1) / total) * 100)
         st_bar.progress(pct)
-        st_status.text(f"正在分析趋势: {code} {name} ...")
+        st_status.text(f"正在分析 [{i+1}/{total}]: {code} {name}")
         
         # 获取历史
         df_hist = get_stock_history_tencent(code)
-        if len(df_hist) < 30: continue
         
-        # 计算20日新高
-        # 排除今天 (如果是盘中，最后一行可能是今天，需要判断日期)
+        if len(df_hist) < 25: continue
+        
+        # 数据对齐：排除当日数据(如果是盘中，腾讯可能包含当日，也可能不包含)
         today_str = datetime.datetime.now().strftime('%Y-%m-%d')
-        last_hist_date = df_hist.iloc[-1]['date'].strftime('%Y-%m-%d')
+        last_k_date = df_hist.iloc[-1]['date'].strftime('%Y-%m-%d')
         
-        if last_hist_date == today_str:
-            hist_subset = df_hist.iloc[:-1]
+        if last_k_date == today_str:
+            # 如果最后一行是今天，取[:-1]作为历史
+            hist_data = df_hist.iloc[:-1]
         else:
-            hist_subset = df_hist
+            hist_data = df_hist
             
-        high_20 = hist_subset['high'].tail(20).max()
-        
-        # Plan A: 突破
-        if price > high_20:
-            # 计算简易量比 (今天预估量 / 5日均量)
-            try:
-                vol_ma5 = hist_subset['vol'].tail(5).mean()
-                # 腾讯返回的 vol 是手，不需要转换
-                # 简单估算：当前量 / (240分钟 * 进度) -> 全天预估
-                # 这里为了简单，直接对比昨天量
-                last_vol = hist_subset.iloc[-1]['vol']
-                # 既然是突破，我们简单要求 涨幅>2% 且 价格>20日高
-                if row['pct'] > 2.0:
-                    final_list.append({
-                        '代码': code,
-                        '名称': name,
-                        '现价': price,
-                        '涨幅(%)': f"{row['pct']:.2f}",
-                        '20日高点': high_20
-                    })
-            except: pass
+        # 计算指标
+        try:
+            # 20日最高价
+            high_20 = hist_data['high'].tail(20).max()
             
+            # 简易量比 (今日预估量 / 5日均量)
+            # 腾讯接口没直接给量比，我们简单算一下：今日成交量 vs 昨日成交量
+            # 这里为了不依赖实时成交量字段(新浪数据里没有)，我们只看形态突破
+            
+            # === Plan A 判定 ===
+            # 1. 现价突破 20日高点
+            if price > high_20:
+                # 补充计算量比因子 (需要看一眼最新的量)
+                # 这一步比较难，因为新浪列表没给量比。
+                # 我们假设：能上成交额榜单前300的，量能绝对够了。
+                
+                results.append({
+                    '代码': code,
+                    '名称': name,
+                    '现价': price,
+                    '涨幅(%)': row['pct'],
+                    '20日高点': high_20,
+                    '突破幅度(%)': round((price - high_20)/high_20 * 100, 2)
+                })
+        except:
+            pass
+            
+        # 延时防封
+        time.sleep(0.1)
+    
     st_bar.progress(100)
-    st_status.success("扫描完成")
-    return pd.DataFrame(final_list)
+    st_status.success("扫描完成！")
+    
+    return pd.DataFrame(results)
 
-def check_portfolio_tencent(code, cost, market_safe):
-    try:
-        # 实时
-        df_rt = get_realtime_batch_tencent([code])
-        if df_rt.empty: return None, "代码错误"
-        
-        price = df_rt.iloc[0]['price']
-        name = df_rt.iloc[0]['name']
-        
-        # 历史
-        df_hist = get_stock_history_tencent(code)
-        if df_hist.empty: return None, "无历史数据"
-        
-        low_10 = df_hist['low'].tail(11).iloc[:-1].min()
-        profit = (price - cost) / cost * 100
-        
-        advice = "✅ 持股待涨"
-        bg = "#d4edda"
-        
-        if not market_safe:
-            advice = "🛑 卖出 (大盘破位)"
-            bg = "#f8d7da"
-        elif price < low_10:
-            advice = f"🛑 卖出 (跌破10日低点 {low_10})"
-            bg = "#f8d7da"
-        elif profit < -8:
-            advice = "🛑 卖出 (止损 -8%)"
-            bg = "#f8d7da"
-            
-        return {'name':name, 'price':price, 'profit':profit, 'low_10':low_10, 'advice':advice, 'bg':bg}, None
-    except Exception as e:
-        return None, str(e)
+# === 🖥️ UI 界面 ===
+st.markdown("""
+<style>
+    .stApp {background-color: #F0F2F5;}
+    div.stButton > button {background-color: #7B8D8E; color:white; width: 100%;}
+    div[data-testid="stMetricValue"] {font-size: 24px;}
+</style>
+""", unsafe_allow_html=True)
 
-# === 🖥️ UI ===
-st.markdown("""<style>.stApp {background-color: #F0F2F5;} div.stButton > button {background-color: #7B8D8E; color:white;}</style>""", unsafe_allow_html=True)
+st.title("🦅 Plan A 猎人终端 (终极版)")
+st.caption("策略：海龟突破改良版 | 数据源：腾讯财经+新浪财经")
 
-st.title("🦅 Plan A 猎人终端 (腾讯极速版)")
+# --- 大盘看板 ---
+safe, idx, ma60, msg = get_hs300_status()
 
-safe, idx, ma60 = check_market_status()
-c1, c2, c3 = st.columns(3)
-c1.metric("沪深300", f"{idx:.2f}")
-c2.metric("MA60生命线", f"{ma60:.2f}")
-if safe: c3.success("🛡️ 环境安全")
-else: c3.error("🛑 环境危险")
+col1, col2, col3 = st.columns(3)
+col1.metric("沪深300指数", f"{idx:.2f}", delta=None)
+col2.metric("MA60牛熊线", f"{ma60:.2f}")
 
-tab1, tab2 = st.tabs(["🔥 扫描", "🩺 诊断"])
+if idx == 0:
+    col3.warning(f"数据连接失败: {msg}")
+elif safe:
+    col3.success("🛡️ 市场环境：安全 (可做多)")
+else:
+    col3.error("🛑 市场环境：危险 (建议空仓)")
+
+st.divider()
+
+# --- 主功能区 ---
+tab1, tab2 = st.tabs(["🔥 机会扫描", "🩺 持仓诊断"])
 
 with tab1:
-    st.info("数据源：腾讯财经 | 逻辑：扫描市场活跃股 -> 筛选突破20日新高")
-    if st.button("🚀 开始扫描"):
-        res = run_scanner_tencent()
-        if not res.empty:
-            st.dataframe(res, use_container_width=True)
-            st.success(f"发现 {len(res)} 只突破股！")
+    st.info("💡 扫描范围：全市场成交额前 300 名的活跃股 (资金主战场)")
+    if st.button("🚀 开始全市场扫描", type="primary"):
+        if not safe and idx > 0:
+            st.warning("⚠️ 警告：大盘处于空头趋势，突破成功率较低！")
+        
+        df_res = run_full_scan()
+        
+        if not df_res.empty:
+            st.success(f"共发现 {len(df_res)} 只 Plan A 信号股！")
+            # 按涨幅排序
+            df_res = df_res.sort_values('涨幅(%)', ascending=False)
+            st.dataframe(
+                df_res.style.format({'现价': '{:.2f}', '20日高点': '{:.2f}'})
+                          .background_gradient(subset=['涨幅(%)'], cmap='Reds'),
+                use_container_width=True
+            )
+            
+            # 最优推荐
+            best = df_res.iloc[0]
+            st.markdown(f"""
+            ### 🏆 今日首选
+            **{best['名称']} ({best['代码']})**
+            - 现价: **{best['现价']}** (涨幅 {best['涨幅(%)']}%)
+            - 突破力度: 超越20日高点 **{best['突破幅度(%)']}%**
+            """)
         else:
-            st.warning("暂无符合条件的目标")
+            st.info("今日暂无符合 [突破20日新高] 的活跃股。")
 
 with tab2:
     c1, c2 = st.columns(2)
-    code = c1.text_input("代码", "600519")
-    cost = c2.number_input("成本", 1800.0)
-    if st.button("诊断"):
-        res, err = check_portfolio_tencent(code, cost, safe)
-        if err: st.error(err)
-        else:
-            st.markdown(f"""
-            <div style="background-color: {res['bg']}; padding: 15px; border-radius: 10px;">
-            <b>{res['name']}</b> | 现价 {res['price']} | 盈亏 {res['profit']:.2f}%<br>
-            止损位: {res['low_10']}<br>
-            <h3>{res['advice']}</h3>
-            </div>
-            """, unsafe_allow_html=True)
+    input_code = c1.text_input("股票代码", "600519")
+    input_cost = c2.number_input("持仓成本", 1800.0)
+    
+    if st.button("诊断持仓"):
+        with st.spinner("正在诊断..."):
+            df_h = get_stock_history_tencent(input_code)
+            
+            if df_h.empty:
+                st.error("无法获取该股票数据，请检查代码。")
+            else:
+                curr_price = df_h.iloc[-1]['close']
+                # 计算10日低点 (止损线)
+                low_10 = df_h['low'].tail(11).iloc[:-1].min()
+                
+                profit = (curr_price - input_cost) / input_cost * 100
+                
+                advice = ""
+                bg_color = ""
+                
+                if not safe:
+                    advice = "🛑 卖出 (大盘破位)"
+                    bg_color = "#f8d7da"
+                elif curr_price < low_10:
+                    advice = f"🛑 卖出 (跌破10日低点 {low_10})"
+                    bg_color = "#f8d7da"
+                elif profit < -8:
+                    advice = "🛑 卖出 (触及硬止损 -8%)"
+                    bg_color = "#f8d7da"
+                else:
+                    advice = "✅ 持股 (趋势完好)"
+                    bg_color = "#d4edda"
+                
+                st.markdown(f"""
+                <div style="background-color: {bg_color}; padding: 20px; border-radius: 10px;">
+                    <h3>{advice}</h3>
+                    <p>当前价格: {curr_price}</p>
+                    <p>当前盈亏: {profit:.2f}%</p>
+                    <p>止损红线 (10日低点): {low_10}</p>
+                </div>
+                """, unsafe_allow_html=True)
